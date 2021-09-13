@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"go/build"
 	"io/fs"
@@ -24,44 +25,52 @@ import (
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
+
 func main() {
 	log.SetHandler(logcli.Default)
+	var updateMods bool
+	flag.BoolVar(&updateMods, "update", false, "discover and update")
+	flag.Parse()
 	rootDir, err := os.Getwd()
-	fmt.Printf("Root Working Direcotry: %s\n", rootDir)
+	fmt.Printf("Root Working Directory: %s\n", rootDir)
 	if err != nil {
 		panic(err)
 	}
 	goModDirs := findGoModFiles(rootDir)
 	for i := range goModDirs {
 		goModDir := filepath.Dir(goModDirs[i])
-		fmt.Println("Changing to "+goModDir)
+		fmt.Println("Changing to " + goModDir)
 		chErr := os.Chdir(goModDir)
 		if chErr != nil {
 			panic(chErr)
 		}
 		base.Cwd()
 		base.ChangeCwd(goModDir)
-		modules, dicoverErr := discover()
-		if dicoverErr != nil {
-			panic(err)
+		if updateMods {
+			modules, dicoverErr := discover()
+			if dicoverErr != nil && modules == nil {
+				fmt.Println(dicoverErr)
+				continue
+			}
+			fmt.Println("running updates:", len(modules))
+			update(modules)
 		}
-		update(modules, "")
-
 		newDir, wdErr := os.Getwd()
 		if wdErr != nil {
 			panic(wdErr)
 		}
-		fmt.Printf("Current Working Direcotry: %s\n", newDir)
+		fmt.Printf("Current Working Directory: %s\n", newDir)
 		cmdTidy.Run(context.Background(), cmdTidy, []string{})
 	}
-
 }
 
-// findGoModfiles is pretty stupid
+// findGoModfiles is pretty stupid.
 func findGoModFiles(root string) []string {
 	var a []string
 	err := filepath.WalkDir(root, func(s string, d fs.DirEntry, e error) error {
-		if e != nil { return e }
+		if e != nil {
+			return e
+		}
 		if d.Name() == "go.mod" {
 			a = append(a, s)
 		}
@@ -142,6 +151,7 @@ func (f *goVersionFlag) Set(s string) error {
 	f.v = s
 	return nil
 }
+
 // runTidy tends to change upstream. A lot. The specific version I looted:
 // https://github.com/golang/go/blame/fa6aa872225f8d33a90d936e7a81b64d2cea68e1/src/cmd/go/internal/modcmd/tidy.go#L114
 func runTidy(ctx context.Context, _ *base.Command, _ []string) {
@@ -149,17 +159,17 @@ func runTidy(ctx context.Context, _ *base.Command, _ []string) {
 		tidyGo     goVersionFlag // go version to write to the tidied go.mod file (toggles lazy loading)
 		tidyCompat goVersionFlag // go version for which the tidied go.mod and go.sum files should be “compatible”
 	)
-	tidyGo =  goVersionFlag{
+	tidyGo = goVersionFlag{
 		v: runtime.Version(),
 	}
-	tidyCompat =  goVersionFlag{
+	tidyCompat = goVersionFlag{
 		v: runtime.Version(),
 	}
 
-	os.Setenv("GOFLAGS","-mod=mod")
+	os.Setenv("GOFLAGS", "-mod=mod")
 	cfg.BuildMod = "mod"
-	cfg.BuildModExplicit=true
-	//modload.DisallowWriteGoMod()
+	cfg.BuildModExplicit = true
+	// modload.DisallowWriteGoMod()
 	modload.AllowWriteGoMod()
 	// Tidy aims to make 'go test' reproducible for any package in 'all', so we
 	// need to include test dependencies. For modules that specify go 1.15 or
@@ -190,7 +200,6 @@ func runTidy(ctx context.Context, _ *base.Command, _ []string) {
 	modload.AllowWriteGoMod()
 	fmt.Println("allowed write Go Mod")
 	modload.WriteGoMod(ctx)
-
 }
 
 // LatestGoVersion returns the latest version of the Go language supported by
@@ -261,8 +270,6 @@ func discover() ([]Module, error) {
 	return modules, nil
 }
 
-
-
 func padRight(str string, length int) string {
 	if len(str) >= length {
 		return str
@@ -323,9 +330,14 @@ func formatName(module Module, length int) string {
 	return c(padRight(module.name, length))
 }
 
-func update(modules []Module, hook string) {
+func update(modules []Module) {
 	for _, x := range modules {
-		fmt.Fprintf(color.Output, "Updating %s to version %s...\n", formatName(x, len(x.name)), formatTo(x))
+		fmt.Fprintf(
+			color.Output,
+			"Updating %s to version %s...\n",
+			formatName(x, len(x.name)),
+			formatTo(x),
+		)
 		out, err := exec.Command("go", "get", x.name).CombinedOutput()
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -333,18 +345,6 @@ func update(modules []Module, hook string) {
 				"name":  x.name,
 				"out":   string(out),
 			}).Error("Error while updating module")
-		}
-		if hook != "" {
-			out, err := exec.Command(hook, x.name, x.from.String(), x.to.String()).CombinedOutput()
-			if err != nil {
-				log.WithFields(log.Fields{
-					"error": err,
-					"hook":  hook,
-					"out":   string(out),
-				}).Error("Error while executing hook")
-				os.Exit(1)
-			}
-			log.Info(string(out))
 		}
 	}
 }
