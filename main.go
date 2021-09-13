@@ -1,22 +1,31 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"github.com/dependabot/gomodules-extracted/cmd/go/_internal_/imports"
 	"go/build"
+	"io/fs"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 
+	altsemver "github.com/Masterminds/semver/v3"
+	"github.com/apex/log"
+	logcli "github.com/apex/log/handlers/cli"
 	"github.com/dependabot/gomodules-extracted/cmd/go/_internal_/base"
 	"github.com/dependabot/gomodules-extracted/cmd/go/_internal_/cfg"
+	"github.com/dependabot/gomodules-extracted/cmd/go/_internal_/imports"
 	"github.com/dependabot/gomodules-extracted/cmd/go/_internal_/modload"
+	"github.com/fatih/color"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
-	"io/fs"
-	"path/filepath"
 )
 func main() {
+	log.SetHandler(logcli.Default)
 	rootDir, err := os.Getwd()
 	fmt.Printf("Root Working Direcotry: %s\n", rootDir)
 	if err != nil {
@@ -30,13 +39,20 @@ func main() {
 		if chErr != nil {
 			panic(chErr)
 		}
-		base.Cwd = goModDir
+		base.Cwd()
+		base.ChangeCwd(goModDir)
+		modules, dicoverErr := discover()
+		if dicoverErr != nil {
+			panic(err)
+		}
+		update(modules, "")
+
 		newDir, wdErr := os.Getwd()
 		if wdErr != nil {
 			panic(wdErr)
 		}
 		fmt.Printf("Current Working Direcotry: %s\n", newDir)
-		cmdTidy.Run(context.Background(), cmdTidy, os.Args)
+		cmdTidy.Run(context.Background(), cmdTidy, []string{})
 	}
 
 }
@@ -129,6 +145,17 @@ func (f *goVersionFlag) Set(s string) error {
 // runTidy tends to change upstream. A lot. The specific version I looted:
 // https://github.com/golang/go/blame/fa6aa872225f8d33a90d936e7a81b64d2cea68e1/src/cmd/go/internal/modcmd/tidy.go#L114
 func runTidy(ctx context.Context, _ *base.Command, _ []string) {
+	var (
+		tidyGo     goVersionFlag // go version to write to the tidied go.mod file (toggles lazy loading)
+		tidyCompat goVersionFlag // go version for which the tidied go.mod and go.sum files should be “compatible”
+	)
+	tidyGo =  goVersionFlag{
+		v: runtime.Version(),
+	}
+	tidyCompat =  goVersionFlag{
+		v: runtime.Version(),
+	}
+
 	os.Setenv("GOFLAGS","-mod=mod")
 	cfg.BuildMod = "mod"
 	cfg.BuildModExplicit=true
@@ -148,22 +175,21 @@ func runTidy(ctx context.Context, _ *base.Command, _ []string) {
 	modload.RootMode = modload.NeedRoot
 	fmt.Println("about to load packages")
 	modload.LoadPackages(ctx, modload.PackageOpts{
+		GoVersion:                tidyGo.String(),
 		Tags:                     imports.AnyTags(),
+		Tidy:                     true,
+		TidyCompatibleVersion:    tidyCompat.String(),
+		VendorModulesInGOROOTSrc: true,
 		ResolveMissingImports:    true,
 		LoadTests:                true,
 		AllowErrors:              true,
-		SilenceErrors: true,
 		SilenceMissingStdImports: true,
-		SilenceUnmatchedWarnings: true,
 	}, "all")
 	fmt.Println("loaded packages")
-	modload.TidyBuildList()
-	fmt.Println("tidied buildlist")
-	modload.TrimGoSum()
-	fmt.Println("trimmed GoSum")
+
 	modload.AllowWriteGoMod()
 	fmt.Println("allowed write Go Mod")
-	modload.WriteGoMod()
+	modload.WriteGoMod(ctx)
 
 }
 
@@ -178,4 +204,147 @@ func LatestGoVersion() string {
 		base.Fatalf("go: internal error: unrecognized default version %q", version)
 	}
 	return version[2:]
+}
+
+type Module struct {
+	name string
+	from *altsemver.Version
+	to   *altsemver.Version
+}
+
+func discover() ([]Module, error) {
+	log.Info("Discovering modules...")
+	args := []string{
+		"list",
+		"-u",
+		"-mod=mod",
+		"-f",
+		"'{{if (and (not (or .Main .Indirect)) .Update)}}{{.Path}}: {{.Version}} -> {{.Update.Version}}{{end}}'",
+		"-m",
+		"all",
+	}
+	list, err := exec.Command("go", args...).Output()
+	if err != nil {
+		return nil, fmt.Errorf("Error running go command to discover modules: %w", err)
+	}
+	split := strings.Split(string(list), "\n")
+	modules := []Module{}
+	re := regexp.MustCompile(`'(.+): (.+) -> (.+)'`)
+	for _, x := range split {
+		if x != "''" && x != "" {
+			matched := re.FindStringSubmatch(x)
+			if len(matched) < 4 {
+				return nil, fmt.Errorf("Couldn't parse module %s", x)
+			}
+			name, from, to := matched[1], matched[2], matched[3]
+			log.WithFields(log.Fields{
+				"name": name,
+				"from": from,
+				"to":   to,
+			}).Debug("Found module")
+			fromversion, err := altsemver.NewVersion(from)
+			if err != nil {
+				return nil, err
+			}
+			toversion, err := altsemver.NewVersion(to)
+			if err != nil {
+				return nil, err
+			}
+			d := Module{
+				name: name,
+				from: fromversion,
+				to:   toversion,
+			}
+			modules = append(modules, d)
+		}
+	}
+	return modules, nil
+}
+
+
+
+func padRight(str string, length int) string {
+	if len(str) >= length {
+		return str
+	}
+	return str + strings.Repeat(" ", length-len(str))
+}
+
+func formatFrom(from *altsemver.Version, length int) string {
+	c := color.New(color.FgBlue).SprintFunc()
+	return c(padRight(from.String(), length))
+}
+
+func formatTo(module Module) string {
+	green := color.New(color.FgGreen).SprintFunc()
+	var buf bytes.Buffer
+	from := module.from
+	to := module.to
+	same := true
+	fmt.Fprintf(&buf, "%d.", to.Major())
+	if from.Minor() == to.Minor() {
+		fmt.Fprintf(&buf, "%d.", to.Minor())
+	} else {
+		fmt.Fprintf(&buf, "%s%s", green(to.Minor()), green("."))
+		same = false
+	}
+	if from.Patch() == to.Patch() && same {
+		fmt.Fprintf(&buf, "%d", to.Patch())
+	} else {
+		fmt.Fprintf(&buf, "%s", green(to.Patch()))
+		same = false
+	}
+	if to.Prerelease() != "" {
+		if from.Prerelease() == to.Prerelease() && same {
+			fmt.Fprintf(&buf, "-%s", to.Prerelease())
+		} else {
+			fmt.Fprintf(&buf, "-%s", green(to.Prerelease()))
+		}
+	}
+	if to.Metadata() != "" {
+		fmt.Fprintf(&buf, "%s%s", green("+"), green(to.Metadata()))
+	}
+	return buf.String()
+}
+
+func formatName(module Module, length int) string {
+	c := color.New(color.FgWhite).SprintFunc()
+	from := module.from
+	to := module.to
+	if from.Minor() != to.Minor() {
+		c = color.New(color.FgYellow).SprintFunc()
+	}
+	if from.Patch() != to.Patch() {
+		c = color.New(color.FgGreen).SprintFunc()
+	}
+	if from.Prerelease() != to.Prerelease() {
+		c = color.New(color.FgRed).SprintFunc()
+	}
+	return c(padRight(module.name, length))
+}
+
+func update(modules []Module, hook string) {
+	for _, x := range modules {
+		fmt.Fprintf(color.Output, "Updating %s to version %s...\n", formatName(x, len(x.name)), formatTo(x))
+		out, err := exec.Command("go", "get", x.name).CombinedOutput()
+		if err != nil {
+			log.WithFields(log.Fields{
+				"error": err,
+				"name":  x.name,
+				"out":   string(out),
+			}).Error("Error while updating module")
+		}
+		if hook != "" {
+			out, err := exec.Command(hook, x.name, x.from.String(), x.to.String()).CombinedOutput()
+			if err != nil {
+				log.WithFields(log.Fields{
+					"error": err,
+					"hook":  hook,
+					"out":   string(out),
+				}).Error("Error while executing hook")
+				os.Exit(1)
+			}
+			log.Info(string(out))
+		}
+	}
 }
